@@ -48,7 +48,10 @@ button[data-baseweb="tab"] p {{ font-size:.95rem; }}
 
 # ───────────────────────── helpers ─────────────────────────
 def chicago_today() -> date:
-    return datetime.now(ZoneInfo("America/Chicago")).date()
+    try:
+        return datetime.now(ZoneInfo("America/Chicago")).date()
+    except Exception:   # Windows without the tzdata package
+        return date.today()
 
 
 def fmt(x, d=1, dash="—"):
@@ -118,7 +121,16 @@ def time_txt(s):
 
 
 # ───────────────────────── first run ─────────────────────────
-db.seed_if_empty(os.path.join(HERE, "data", "ACWR Throwing Plan Fall 2026.xlsx"))
+def find_file(name, *folders):
+    """Look in the usual subfolder first, then next to app.py (in case files were uploaded flat)."""
+    for folder in (*folders, ""):
+        path = os.path.join(HERE, folder, name)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+db.seed_if_empty(find_file("ACWR Throwing Plan Fall 2026.xlsx", "data"))
 
 for msg in st.session_state.pop("_toasts", []):
     st.toast(msg, icon="✅")
@@ -127,10 +139,16 @@ players = db.load_players()
 
 # ───────────────────────── sidebar ─────────────────────────
 with st.sidebar:
-    st.image(os.path.join(HERE, "assets", "baseball-wordmark.png"), width="stretch")
+    logo = find_file("baseball-wordmark.png", "assets")
+    if logo:
+        st.image(logo, width="stretch")
     st.markdown("### Throw Log · Fall 2026")
     today = st.date_input("Today's date", value=chicago_today(), key="today", format="MM/DD/YYYY")
     st.caption("Everything you enter saves automatically.")
+    if db.using_online_db():
+        st.caption("🟢 Saving to the team's online database")
+    else:
+        st.caption("💻 Saving on this computer (data/throwing.db)")
     st.divider()
     with st.expander("Import / backup"):
         up = st.file_uploader("Import the ACWR Excel workbook", type=["xlsx"])
