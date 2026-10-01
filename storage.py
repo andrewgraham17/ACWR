@@ -1,15 +1,21 @@
-"""SQLite storage. Every function writes immediately, so the app autosaves on each change."""
+"""Storage. Every function writes immediately, so the app autosaves on each change.
+
+Where the data goes:
+  * DATABASE_URL set (Streamlit secrets or an environment variable) -> that online database
+    (e.g. a free Neon / Supabase Postgres). Use this when the app is deployed on the web.
+  * otherwise -> data/throwing.db, a SQLite file next to the app (fine on your own computer).
+"""
 from __future__ import annotations
 
 import os
 import re
-import sqlite3
 import time
 import unicodedata
 import uuid
 from datetime import date, datetime
 
 import pandas as pd
+from sqlalchemy import create_engine, text
 
 DB_PATH = os.environ.get("THROW_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "throwing.db"))
 
@@ -41,17 +47,62 @@ def slugify(name: str) -> str:
     return re.sub(r"-+", "-", re.sub(r"[\s_]+", "-", s))
 
 
-def _db():
+def database_url() -> str:
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        try:
+            import streamlit as st
+            url = st.secrets.get("DATABASE_URL")
+        except Exception:
+            url = None
+    if url:
+        url = url.strip().strip('"')
+        if url.startswith("postgres://"):
+            url = "postgresql://" + url[len("postgres://"):]
+        if url.startswith("postgresql://"):            # use the psycopg2 driver in requirements.txt
+            url = "postgresql+psycopg2://" + url[len("postgresql://"):]
+        return url
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    c = sqlite3.connect(DB_PATH)
-    c.execute("""CREATE TABLE IF NOT EXISTS players(
-        id TEXT PRIMARY KEY, name TEXT, number TEXT, position TEXT, year TEXT, bt TEXT,
-        avg_top_velo REAL, peak_velo REAL, active INTEGER DEFAULT 1, sort INTEGER,
-        target_type TEXT DEFAULT 'Game', target_date TEXT, planned_pitches REAL, planned_innings REAL)""")
-    cols = ", ".join(f + (" REAL" if f in NUM_FIELDS else " TEXT") for f in LOG_FIELDS)
-    c.execute(f"CREATE TABLE IF NOT EXISTS throws(id TEXT PRIMARY KEY, player TEXT, created REAL, updated REAL, {cols})")
-    c.execute("CREATE TABLE IF NOT EXISTS overrides(player TEXT, day TEXT, day_type TEXT, PRIMARY KEY(player, day))")
-    return c
+    return "sqlite:///" + DB_PATH
+
+
+def using_online_db() -> bool:
+    return not database_url().startswith("sqlite")
+
+
+_ENGINE = None
+
+
+def _engine():
+    global _ENGINE
+    if _ENGINE is None:
+        _ENGINE = create_engine(database_url(), pool_pre_ping=True, future=True)
+        num = "DOUBLE PRECISION"
+        cols = ", ".join(f"{f} {num if f in NUM_FIELDS else 'TEXT'}" for f in LOG_FIELDS)
+        with _ENGINE.begin() as c:
+            c.execute(text(f"""CREATE TABLE IF NOT EXISTS players(
+                id TEXT PRIMARY KEY, name TEXT, number TEXT, position TEXT, year TEXT, bt TEXT,
+                avg_top_velo {num}, peak_velo {num}, active INTEGER DEFAULT 1, sort INTEGER,
+                target_type TEXT DEFAULT 'Game', target_date TEXT, planned_pitches {num}, planned_innings {num})"""))
+            c.execute(text(f"CREATE TABLE IF NOT EXISTS throws(id TEXT PRIMARY KEY, player TEXT, created {num}, updated {num}, {cols})"))
+            c.execute(text("CREATE TABLE IF NOT EXISTS overrides(player TEXT, day TEXT, day_type TEXT, PRIMARY KEY(player, day))"))
+    return _ENGINE
+
+
+def _run(sql, **params):
+    with _engine().begin() as c:
+        return c.execute(text(sql), params)
+
+
+def _one(sql, **params):
+    with _engine().begin() as c:
+        r = c.execute(text(sql), params).fetchone()
+    return r
+
+
+def _df(sql, **params) -> pd.DataFrame:
+    with _engine().connect() as c:
+        return pd.read_sql(text(sql), c, params=params)
 
 
 def _clean(field, v):
@@ -74,9 +125,7 @@ def _clean(field, v):
 
 # ───────── players ─────────
 def load_players(include_inactive=False) -> pd.DataFrame:
-    with _db() as c:
-        df = pd.read_sql("SELECT * FROM players" + ("" if include_inactive else " WHERE active=1") +
-                         " ORDER BY sort, name", c)
+    df = _df("SELECT * FROM players" + ("" if include_inactive else " WHERE active=1") + " ORDER BY sort, name")
     df["target_date"] = [date.fromisoformat(v) if isinstance(v, str) and v else None for v in df["target_date"]]
     df["target_date"] = df["target_date"].astype(object)
     return df
@@ -98,31 +147,36 @@ def get_player(pid) -> dict | None:
 
 def add_player(name, number="", position="RHP", year=None, bt=None, avg_top=None, peak=None) -> str:
     pid = slugify(name)
-    with _db() as c:
-        n = c.execute("SELECT COALESCE(MAX(sort), 0) + 1 FROM players").fetchone()[0]
-        exists = c.execute("SELECT 1 FROM players WHERE id=?", (pid,)).fetchone()
-        if exists:  # re-adding a removed player brings his log back
-            c.execute("UPDATE players SET active=1, name=?, number=?, position=? WHERE id=?", (name.strip(), number, position, pid))
-            if avg_top is not None:
-                c.execute("UPDATE players SET avg_top_velo=? WHERE id=?", (avg_top, pid))
-        else:
-            c.execute("""INSERT INTO players(id, name, number, position, year, bt, avg_top_velo, peak_velo, active, sort)
-                         VALUES (?,?,?,?,?,?,?,?,1,?)""", (pid, name.strip(), number, position, year, bt, avg_top, peak, n))
+    n = _one("SELECT COALESCE(MAX(sort), 0) + 1 FROM players")[0]
+    if _one("SELECT 1 FROM players WHERE id=:id", id=pid):   # re-adding a removed player brings his log back
+        _run("UPDATE players SET active=1, name=:n, number=:num, position=:pos WHERE id=:id",
+             n=name.strip(), num=number, pos=position, id=pid)
+        if avg_top is not None:
+            _run("UPDATE players SET avg_top_velo=:v WHERE id=:id", v=avg_top, id=pid)
+    else:
+        _run("""INSERT INTO players(id, name, number, position, year, bt, avg_top_velo, peak_velo, active, sort)
+                VALUES (:id, :n, :num, :pos, :yr, :bt, :avg, :peak, 1, :sort)""",
+             id=pid, n=name.strip(), num=number, pos=position, yr=year, bt=bt, avg=avg_top, peak=peak, sort=int(n))
     return pid
 
 
 def update_player(pid, **fields):
     allowed = {"name", "number", "position", "year", "bt", "avg_top_velo", "peak_velo", "active",
                "target_type", "target_date", "planned_pitches", "planned_innings"}
-    with _db() as c:
-        for k, v in fields.items():
-            if k not in allowed:
-                continue
-            if isinstance(v, date):
-                v = v.isoformat()
-            if isinstance(v, float) and pd.isna(v):
-                v = None
-            c.execute(f"UPDATE players SET {k}=? WHERE id=?", (v, pid))
+    for k, v in fields.items():
+        if k not in allowed:
+            continue
+        if isinstance(v, date):
+            v = v.isoformat()
+        if isinstance(v, float) and pd.isna(v):
+            v = None
+        if hasattr(v, "item"):          # numpy number -> plain Python
+            v = v.item()
+        if k in ("avg_top_velo", "peak_velo", "planned_pitches", "planned_innings") and v is not None:
+            v = float(v)
+        if k in ("active", "sort") and v is not None:
+            v = int(v)
+        _run(f"UPDATE players SET {k}=:v WHERE id=:id", v=v, id=pid)
 
 
 def remove_player(pid):
@@ -132,25 +186,23 @@ def remove_player(pid):
 
 # ───────── throw log (row level) ─────────
 def load_log(pid) -> pd.DataFrame:
-    with _db() as c:
-        df = pd.read_sql(f"SELECT id, created, {', '.join(LOG_FIELDS)} FROM throws WHERE player=?", c, params=(pid,))
+    df = _df(f"SELECT id, created, {', '.join(LOG_FIELDS)} FROM throws WHERE player=:p", p=pid)
     df = df.sort_values(["date", "created"], ascending=False, na_position="last").reset_index(drop=True)
     return df
 
 
 def get_row(row_id) -> dict | None:
-    with _db() as c:
-        c.row_factory = sqlite3.Row
-        r = c.execute("SELECT * FROM throws WHERE id=?", (row_id,)).fetchone()
-    return dict(r) if r else None
+    r = _one("SELECT * FROM throws WHERE id=:id", id=row_id)
+    return dict(r._mapping) if r else None
 
 
 def add_row(pid, rec: dict) -> str:
     rid = uuid.uuid4().hex[:12]
     now = time.time()
-    with _db() as c:
-        c.execute(f"INSERT INTO throws(id, player, created, updated, {', '.join(LOG_FIELDS)}) VALUES (?,?,?,?{',?' * len(LOG_FIELDS)})",
-                  [rid, pid, rec.get("created", now), now] + [_clean(f, rec.get(f)) for f in LOG_FIELDS])
+    vals = {f: _clean(f, rec.get(f)) for f in LOG_FIELDS}
+    _run(f"INSERT INTO throws(id, player, created, updated, {', '.join(LOG_FIELDS)}) "
+         f"VALUES (:id, :player, :created, :updated, {', '.join(':' + f for f in LOG_FIELDS)})",
+         id=rid, player=pid, created=float(rec.get("created") or now), updated=now, **vals)
     return rid
 
 
@@ -158,40 +210,37 @@ def update_row(row_id, rec: dict):
     fields = [f for f in LOG_FIELDS if f in rec]
     if not fields:
         return
-    with _db() as c:
-        c.execute(f"UPDATE throws SET {', '.join(f + '=?' for f in fields)}, updated=? WHERE id=?",
-                  [_clean(f, rec[f]) for f in fields] + [time.time(), row_id])
+    _run(f"UPDATE throws SET {', '.join(f'{f}=:{f}' for f in fields)}, updated=:updated WHERE id=:id",
+         updated=time.time(), id=row_id, **{f: _clean(f, rec[f]) for f in fields})
 
 
 def delete_row(row_id):
-    with _db() as c:
-        c.execute("DELETE FROM throws WHERE id=?", (row_id,))
+    _run("DELETE FROM throws WHERE id=:id", id=row_id)
 
 
 # ───────── overrides ─────────
 def load_overrides(pid) -> dict:
-    with _db() as c:
-        return {date.fromisoformat(d): t for d, t in c.execute("SELECT day, day_type FROM overrides WHERE player=?", (pid,))}
+    with _engine().connect() as c:
+        rows = c.execute(text("SELECT day, day_type FROM overrides WHERE player=:p"), {"p": pid}).fetchall()
+    return {date.fromisoformat(d): t for d, t in rows}
 
 
 def save_override(pid, day: date, day_type):
-    with _db() as c:
-        if not day_type or day_type == "(none)":
-            c.execute("DELETE FROM overrides WHERE player=? AND day=?", (pid, day.isoformat()))
-        else:
-            c.execute("INSERT OR REPLACE INTO overrides VALUES (?,?,?)", (pid, day.isoformat(), day_type))
+    if not day_type or day_type == "(none)":
+        _run("DELETE FROM overrides WHERE player=:p AND day=:d", p=pid, d=day.isoformat())
+    else:
+        _run("""INSERT INTO overrides(player, day, day_type) VALUES (:p, :d, :t)
+                ON CONFLICT(player, day) DO UPDATE SET day_type=excluded.day_type""", p=pid, d=day.isoformat(), t=day_type)
 
 
 def clear_overrides(pid):
-    with _db() as c:
-        c.execute("DELETE FROM overrides WHERE player=?", (pid,))
+    _run("DELETE FROM overrides WHERE player=:p", p=pid)
 
 
 # ───────── first run / import ─────────
 def seed_if_empty(workbook_path=None):
-    with _db() as c:
-        if c.execute("SELECT COUNT(*) FROM players").fetchone()[0]:
-            return False
+    if _one("SELECT COUNT(*) FROM players")[0]:
+        return False
     for num, name, pos, yr, bt in DEFAULT_ROSTER:
         add_player(name, num, pos, yr, bt)
     if workbook_path and os.path.exists(workbook_path):
@@ -234,8 +283,7 @@ def import_workbook(src) -> tuple[int, int]:
     for pid, recs in by_player.items():
         if get_player(pid) is None:
             add_player(pid.replace("-", " ").title())
-        with _db() as c:
-            c.execute("DELETE FROM throws WHERE player=?", (pid,))   # replace, never duplicate
+        _run("DELETE FROM throws WHERE player=:p", p=pid)   # replace, never duplicate
         for rec in recs:
             add_row(pid, rec)
             n += 1
